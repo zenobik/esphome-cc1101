@@ -1,0 +1,163 @@
+diff --git a/components/wmbus_radio/component.cpp b/components/wmbus_radio/component.cpp
+index a0a4ae9..29f5971 100644
+--- a/components/wmbus_radio/component.cpp
++++ b/components/wmbus_radio/component.cpp
+@@ -83,11 +83,18 @@ void Radio::wakeup_receiver_task_from_isr(TaskHandle_t *arg) {
+ }
+ 
+ void Radio::receive_frame() {
++  if (this->apply_pending_frequency_())
++    return;
++
+   if (!ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(60000))) {
+     this->radio->restart_rx();
+     return;
+   }
+ 
++  // Woken up by set_frequency() rather than by the radio
++  if (this->apply_pending_frequency_())
++    return;
++
+   auto packet = std::make_unique<Packet>();
+ 
+   if (!this->radio->read_in_task(packet->rx_data_ptr(), packet->rx_capacity(), 0)) {
+@@ -130,5 +137,30 @@ void Radio::add_frame_handler(std::function<void(Frame *)> &&callback) {
+   this->handlers_.push_back(std::move(callback));
+ }
+ 
++void Radio::set_frequency(uint32_t hz) {
++  if (hz == 0)
++    return;
++  this->pending_frequency_.store(hz);
++  if (this->receiver_task_handle_ != nullptr)
++    xTaskNotifyGive(this->receiver_task_handle_);
++}
++
++uint32_t Radio::get_frequency() {
++  uint32_t pending = this->pending_frequency_.load();
++  return pending ? pending : this->radio->get_frequency_hz();
++}
++
++bool Radio::apply_pending_frequency_() {
++  uint32_t hz = this->pending_frequency_.exchange(0);
++  if (hz == 0)
++    return false;
++  if (hz == this->radio->get_frequency_hz())
++    return true;
++  if (!this->radio->retune(hz))
++    ESP_LOGW(TAG, "%s does not support changing frequency at runtime",
++             this->radio->get_name());
++  return true;
++}
++
+ } // namespace wmbus_radio
+ } // namespace esphome
+diff --git a/components/wmbus_radio/component.h b/components/wmbus_radio/component.h
+index 6bba089..5dc8076 100644
+--- a/components/wmbus_radio/component.h
++++ b/components/wmbus_radio/component.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <functional>
+ 
+ #include "freertos/FreeRTOS.h"
+@@ -26,9 +27,17 @@ public:
+ 
+   void add_frame_handler(std::function<void(Frame *)> &&callback);
+ 
++  // Request a frequency change (safe to call from lambdas). The radio is
++  // retuned by the receiver task, so SPI access is never concurrent.
++  void set_frequency(uint32_t hz);
++  uint32_t get_frequency();
++
+ protected:
+   static void wakeup_receiver_task_from_isr(TaskHandle_t *arg);
+   static void receiver_task(Radio *arg);
++  bool apply_pending_frequency_();
++
++  std::atomic<uint32_t> pending_frequency_{0};
+ 
+   RadioTransceiver *radio{nullptr};
+   TaskHandle_t receiver_task_handle_{nullptr};
+diff --git a/components/wmbus_radio/transceiver.h b/components/wmbus_radio/transceiver.h
+index fefb183..de4af9f 100644
+--- a/components/wmbus_radio/transceiver.h
++++ b/components/wmbus_radio/transceiver.h
+@@ -45,6 +45,11 @@ public:
+   virtual int8_t get_rssi() = 0;
+   virtual const char *get_name() = 0;
+ 
++  // Change operating frequency at runtime. Must be called from the receiver
++  // task (use Radio::set_frequency()). Returns false if not supported.
++  virtual bool retune(uint32_t hz) { return false; }
++  uint32_t get_frequency_hz() const { return this->frequency_hz_; }
++
+   // Frame-based reading interface
+   // Returns number of bytes read (0 if no data available yet)
+   // SX1276: returns 1 (byte-by-byte FIFO reading)
+diff --git a/components/wmbus_radio/transceiver_cc1101.cpp b/components/wmbus_radio/transceiver_cc1101.cpp
+index ebc1b7c..b2a05c5 100644
+--- a/components/wmbus_radio/transceiver_cc1101.cpp
++++ b/components/wmbus_radio/transceiver_cc1101.cpp
+@@ -67,11 +67,7 @@ void CC1101::setup() {
+   this->write_register(CC1101_FSCTRL0, 0x00);
+ 
+   ESP_LOGVV(TAG, "setting radio frequency");
+-  // FREQ = (f_carrier * 2^16) / f_xtal
+-  uint32_t freq_reg = ((uint64_t)this->frequency_hz_ << 16) / F_XTAL;
+-  this->write_register(CC1101_FREQ2, BYTE(freq_reg, 2));
+-  this->write_register(CC1101_FREQ1, BYTE(freq_reg, 1));
+-  this->write_register(CC1101_FREQ0, BYTE(freq_reg, 0));
++  this->write_frequency(this->frequency_hz_);
+ 
+   ESP_LOGVV(TAG, "configuring modem");
+   // Modem configuration for 100 kbps, 2-FSK, 50 kHz deviation
+@@ -253,6 +249,31 @@ void CC1101::restart_rx() {
+   delay(1);
+ }
+ 
++void CC1101::write_frequency(uint32_t hz) {
++  // FREQ = (f_carrier * 2^16) / f_xtal
++  uint32_t freq_reg = ((uint64_t)hz << 16) / F_XTAL;
++  this->write_register(CC1101_FREQ2, BYTE(freq_reg, 2));
++  this->write_register(CC1101_FREQ1, BYTE(freq_reg, 1));
++  this->write_register(CC1101_FREQ0, BYTE(freq_reg, 0));
++}
++
++bool CC1101::retune(uint32_t hz) {
++  // FREQ registers may only be changed in IDLE. MCSM0 has FS_AUTOCAL=01,
++  // so the synthesizer is recalibrated on the IDLE -> RX transition below.
++  this->strobe(CC1101_SIDLE);
++  delay(1);
++  this->frequency_hz_ = hz;
++  this->write_frequency(hz);
++  this->strobe(CC1101_SFRX);
++
++  ulTaskNotifyTake(pdTRUE, 0);
++
++  this->strobe(CC1101_SRX);
++  delay(1);
++  ESP_LOGD(TAG, "Retuned to %.3f MHz", hz / 1e6f);
++  return true;
++}
++
+ int8_t CC1101::get_rssi() {
+   // Convert RSSI_dec to dBm: RSSI_dBm = (RSSI_dec / 2) - RSSI_offset
+   // RSSI offset per TI DN505: 74 dBm for 868 MHz, 76 dBm for 433 MHz
+diff --git a/components/wmbus_radio/transceiver_cc1101.h b/components/wmbus_radio/transceiver_cc1101.h
+index edb3b2f..cf5c8eb 100644
+--- a/components/wmbus_radio/transceiver_cc1101.h
++++ b/components/wmbus_radio/transceiver_cc1101.h
+@@ -168,8 +168,10 @@ public:
+   void restart_rx() override;
+   int8_t get_rssi() override;
+   const char *get_name() override;
++  bool retune(uint32_t hz) override;
+ 
+ protected:
++  void write_frequency(uint32_t hz);
+   optional<uint8_t> read() override;
+ 
+   // CC1101-specific SPI methods

@@ -170,8 +170,10 @@ public:
   bool idle_restart_ready() override;
   int8_t get_rssi() override;
   const char *get_name() override;
+  bool retune(uint32_t hz) override;
 
 protected:
+  void write_frequency(uint32_t hz);
   uint8_t wait_marcstate_(uint8_t state, uint32_t timeout_us);
   uint32_t last_idle_timeout_log_{0};
   optional<uint8_t> read() override;

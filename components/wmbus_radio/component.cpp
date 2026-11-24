@@ -83,6 +83,9 @@ void Radio::wakeup_receiver_task_from_isr(TaskHandle_t *arg) {
 }
 
 void Radio::receive_frame() {
+  if (this->apply_pending_frequency_())
+    return;
+
   // A radio may ask for its receiver to be restarted at a short interval while it
   // waits for a frame (CC1101 does, as version_3 did). It is only restarted while idle,
   // never once a sync word or FIFO data was seen. The overall 60 s timeout is kept.
@@ -107,6 +110,11 @@ void Radio::receive_frame() {
         break;
     }
   }
+
+  // Woken up by set_frequency() rather than by the radio
+  if (this->apply_pending_frequency_())
+    return;
+
   if (!got) {
     this->radio->restart_rx();
     return;
@@ -152,6 +160,31 @@ void Radio::receiver_task(Radio *arg) {
 
 void Radio::add_frame_handler(std::function<void(Frame *)> &&callback) {
   this->handlers_.push_back(std::move(callback));
+}
+
+void Radio::set_frequency(uint32_t hz) {
+  if (hz == 0)
+    return;
+  this->pending_frequency_.store(hz);
+  if (this->receiver_task_handle_ != nullptr)
+    xTaskNotifyGive(this->receiver_task_handle_);
+}
+
+uint32_t Radio::get_frequency() {
+  uint32_t pending = this->pending_frequency_.load();
+  return pending ? pending : this->radio->get_frequency_hz();
+}
+
+bool Radio::apply_pending_frequency_() {
+  uint32_t hz = this->pending_frequency_.exchange(0);
+  if (hz == 0)
+    return false;
+  if (hz == this->radio->get_frequency_hz())
+    return true;
+  if (!this->radio->retune(hz))
+    ESP_LOGW(TAG, "%s does not support changing frequency at runtime",
+             this->radio->get_name());
+  return true;
 }
 
 } // namespace wmbus_radio

@@ -67,11 +67,7 @@ void CC1101::setup() {
   this->write_register(CC1101_FSCTRL0, 0x00);
 
   ESP_LOGVV(TAG, "setting radio frequency");
-  // FREQ = (f_carrier * 2^16) / f_xtal
-  uint32_t freq_reg = ((uint64_t)this->frequency_hz_ << 16) / F_XTAL;
-  this->write_register(CC1101_FREQ2, BYTE(freq_reg, 2));
-  this->write_register(CC1101_FREQ1, BYTE(freq_reg, 1));
-  this->write_register(CC1101_FREQ0, BYTE(freq_reg, 0));
+  this->write_frequency(this->frequency_hz_);
 
   ESP_LOGVV(TAG, "configuring modem");
   // Modem configuration for 100 kbps, 2-FSK, 50 kHz deviation
@@ -284,6 +280,34 @@ bool CC1101::idle_restart_ready() {
     return false;
   // Include the overflow bit: 0x80 must not look like an empty FIFO.
   return this->read_status_register(CC1101_RXBYTES) == 0;
+}
+
+void CC1101::write_frequency(uint32_t hz) {
+  // FREQ = (f_carrier * 2^16) / f_xtal
+  uint32_t freq_reg = ((uint64_t)hz << 16) / F_XTAL;
+  this->write_register(CC1101_FREQ2, BYTE(freq_reg, 2));
+  this->write_register(CC1101_FREQ1, BYTE(freq_reg, 1));
+  this->write_register(CC1101_FREQ0, BYTE(freq_reg, 0));
+}
+
+bool CC1101::retune(uint32_t hz) {
+  // FREQ registers may only be changed in IDLE.
+  this->strobe(CC1101_SIDLE);
+  uint8_t state = this->wait_marcstate_(CC1101_MARCSTATE_IDLE, 5000);
+  if (state == CC1101_MARCSTATE_RXFIFO_OVERFLOW) {
+    this->strobe(CC1101_SFRX);
+    state = this->wait_marcstate_(CC1101_MARCSTATE_IDLE, 5000);
+  }
+  if (state != CC1101_MARCSTATE_IDLE) {
+    ESP_LOGW(TAG, "CC1101 did not enter IDLE (MARCSTATE 0x%02X), frequency unchanged", state);
+    return true;
+  }
+  this->frequency_hz_ = hz;
+  this->write_frequency(hz);
+  // Flush and re-enter RX; FS_AUTOCAL recalibrates the synthesizer on IDLE -> RX.
+  this->restart_rx();
+  ESP_LOGD(TAG, "Retuned to %.3f MHz", hz / 1e6f);
+  return true;
 }
 
 int8_t CC1101::get_rssi() {

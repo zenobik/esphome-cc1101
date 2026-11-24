@@ -49,6 +49,11 @@ public:
   virtual int8_t get_rssi() = 0;
   virtual const char *get_name() = 0;
 
+  // Change operating frequency at runtime. Must be called from the receiver
+  // task (use Radio::set_frequency()). Returns false if not supported.
+  virtual bool retune(uint32_t hz) { return false; }
+  uint32_t get_frequency_hz() const { return this->frequency_hz_; }
+
   // Frame-based reading interface
   // Returns number of bytes read (0 if no data available yet)
   // SX1276: returns 1 (byte-by-byte FIFO reading)

@@ -1,27 +1,30 @@
 diff --git a/components/wmbus_radio/component.cpp b/components/wmbus_radio/component.cpp
-index a0a4ae9..29f5971 100644
+index ee8b6f3..38447ce 100644
 --- a/components/wmbus_radio/component.cpp
 +++ b/components/wmbus_radio/component.cpp
-@@ -83,11 +83,18 @@ void Radio::wakeup_receiver_task_from_isr(TaskHandle_t *arg) {
+@@ -83,6 +83,9 @@ void Radio::wakeup_receiver_task_from_isr(TaskHandle_t *arg) {
  }
  
  void Radio::receive_frame() {
 +  if (this->apply_pending_frequency_())
 +    return;
 +
-   if (!ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(60000))) {
-     this->radio->restart_rx();
-     return;
+   // A radio may ask for its receiver to be restarted at a short interval while it
+   // waits for a frame (CC1101 does, as version_3 did). It is only restarted while idle,
+   // never once a sync word or FIFO data was seen. The overall 60 s timeout is kept.
+@@ -107,6 +110,11 @@ void Radio::receive_frame() {
+         break;
+     }
    }
- 
++
 +  // Woken up by set_frequency() rather than by the radio
 +  if (this->apply_pending_frequency_())
 +    return;
 +
-   auto packet = std::make_unique<Packet>();
- 
-   if (!this->radio->read_in_task(packet->rx_data_ptr(), packet->rx_capacity(), 0)) {
-@@ -130,5 +137,30 @@ void Radio::add_frame_handler(std::function<void(Frame *)> &&callback) {
+   if (!got) {
+     this->radio->restart_rx();
+     return;
+@@ -154,5 +162,30 @@ void Radio::add_frame_handler(std::function<void(Frame *)> &&callback) {
    this->handlers_.push_back(std::move(callback));
  }
  
@@ -82,10 +85,10 @@ index 6bba089..5dc8076 100644
    RadioTransceiver *radio{nullptr};
    TaskHandle_t receiver_task_handle_{nullptr};
 diff --git a/components/wmbus_radio/transceiver.h b/components/wmbus_radio/transceiver.h
-index fefb183..de4af9f 100644
+index bca9bcc..e6f535f 100644
 --- a/components/wmbus_radio/transceiver.h
 +++ b/components/wmbus_radio/transceiver.h
-@@ -45,6 +45,11 @@ public:
+@@ -49,6 +49,11 @@ public:
    virtual int8_t get_rssi() = 0;
    virtual const char *get_name() = 0;
  
@@ -98,7 +101,7 @@ index fefb183..de4af9f 100644
    // Returns number of bytes read (0 if no data available yet)
    // SX1276: returns 1 (byte-by-byte FIFO reading)
 diff --git a/components/wmbus_radio/transceiver_cc1101.cpp b/components/wmbus_radio/transceiver_cc1101.cpp
-index ebc1b7c..b2a05c5 100644
+index 1e17028..8f17d9a 100644
 --- a/components/wmbus_radio/transceiver_cc1101.cpp
 +++ b/components/wmbus_radio/transceiver_cc1101.cpp
 @@ -67,11 +67,7 @@ void CC1101::setup() {
@@ -114,8 +117,8 @@ index ebc1b7c..b2a05c5 100644
  
    ESP_LOGVV(TAG, "configuring modem");
    // Modem configuration for 100 kbps, 2-FSK, 50 kHz deviation
-@@ -253,6 +249,31 @@ void CC1101::restart_rx() {
-   delay(1);
+@@ -286,6 +282,34 @@ bool CC1101::idle_restart_ready() {
+   return this->read_status_register(CC1101_RXBYTES) == 0;
  }
  
 +void CC1101::write_frequency(uint32_t hz) {
@@ -127,18 +130,21 @@ index ebc1b7c..b2a05c5 100644
 +}
 +
 +bool CC1101::retune(uint32_t hz) {
-+  // FREQ registers may only be changed in IDLE. MCSM0 has FS_AUTOCAL=01,
-+  // so the synthesizer is recalibrated on the IDLE -> RX transition below.
++  // FREQ registers may only be changed in IDLE.
 +  this->strobe(CC1101_SIDLE);
-+  delay(1);
++  uint8_t state = this->wait_marcstate_(CC1101_MARCSTATE_IDLE, 5000);
++  if (state == CC1101_MARCSTATE_RXFIFO_OVERFLOW) {
++    this->strobe(CC1101_SFRX);
++    state = this->wait_marcstate_(CC1101_MARCSTATE_IDLE, 5000);
++  }
++  if (state != CC1101_MARCSTATE_IDLE) {
++    ESP_LOGW(TAG, "CC1101 did not enter IDLE (MARCSTATE 0x%02X), frequency unchanged", state);
++    return true;
++  }
 +  this->frequency_hz_ = hz;
 +  this->write_frequency(hz);
-+  this->strobe(CC1101_SFRX);
-+
-+  ulTaskNotifyTake(pdTRUE, 0);
-+
-+  this->strobe(CC1101_SRX);
-+  delay(1);
++  // Flush and re-enter RX; FS_AUTOCAL recalibrates the synthesizer on IDLE -> RX.
++  this->restart_rx();
 +  ESP_LOGD(TAG, "Retuned to %.3f MHz", hz / 1e6f);
 +  return true;
 +}
@@ -147,17 +153,17 @@ index ebc1b7c..b2a05c5 100644
    // Convert RSSI_dec to dBm: RSSI_dBm = (RSSI_dec / 2) - RSSI_offset
    // RSSI offset per TI DN505: 74 dBm for 868 MHz, 76 dBm for 433 MHz
 diff --git a/components/wmbus_radio/transceiver_cc1101.h b/components/wmbus_radio/transceiver_cc1101.h
-index edb3b2f..cf5c8eb 100644
+index f674630..e6f6a87 100644
 --- a/components/wmbus_radio/transceiver_cc1101.h
 +++ b/components/wmbus_radio/transceiver_cc1101.h
-@@ -168,8 +168,10 @@ public:
-   void restart_rx() override;
+@@ -170,8 +170,10 @@ public:
+   bool idle_restart_ready() override;
    int8_t get_rssi() override;
    const char *get_name() override;
 +  bool retune(uint32_t hz) override;
  
  protected:
 +  void write_frequency(uint32_t hz);
+   uint8_t wait_marcstate_(uint8_t state, uint32_t timeout_us);
+   uint32_t last_idle_timeout_log_{0};
    optional<uint8_t> read() override;
- 
-   // CC1101-specific SPI methods

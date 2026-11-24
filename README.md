@@ -10,7 +10,7 @@ częstotliwościami w trakcie pracy. Przykład w `wmbus-xiao.yaml` odczytuje:
 CC1101 domyślnie słucha 868,3 MHz. Co `techem_interval` przestraja się na
 868,95 MHz i wraca po odebraniu ramek Techem (najpóźniej po `techem_window`).
 
-**Status:** prototyp. Kompiluje się (ESPHome 2026.10.1), nie był jeszcze testowany na sprzęcie.
+**Status:** prototyp. Kompiluje się na ESPHome 2026.11.0, nie był jeszcze testowany na sprzęcie.
 
 ## Użycie
 
@@ -48,7 +48,7 @@ Moduł CC1101 musi być w wersji 868 MHz (np. Ebyte E07-900M10S), a nie 433 MHz
 
 Komponenty w `components/` to kopia
 [SzczepanLeon/esphome-components](https://github.com/SzczepanLeon/esphome-components)
-(commit `03484db`, autorzy: @SzczepanLeon, @kubasaw i współtwórcy). Kod
+(commit `76dda80`, autorzy: @SzczepanLeon, @kubasaw i współtwórcy). Kod
 w `wmbus_common` pochodzi z [wmbusmeters](https://github.com/wmbusmeters/wmbusmeters)
 (Fredrik Öhrström i współtwórcy) i jest objęty licencją GPL-3.0-or-later,
 zgodnie z nagłówkami plików. Całość rozpowszechniana jest na licencji GPL-3.0
@@ -58,8 +58,9 @@ zgodnie z nagłówkami plików. Całość rozpowszechniana jest na licencji GPL-
 
 Wyłącznie w `components/wmbus_radio` (pełny diff: `patches/cc1101-retune.patch`):
 
-- `RadioTransceiver::retune(hz)`, zaimplementowane dla CC1101: IDLE, zapis
-  rejestrów FREQ2..0, powrót do RX z automatyczną kalibracją syntezatora,
+- `RadioTransceiver::retune(hz)`, zaimplementowane dla CC1101: przejście do IDLE
+  (z kontrolą MARCSTATE), zapis rejestrów FREQ2..0 i `restart_rx()`, które wraca
+  do RX z automatyczną kalibracją syntezatora,
 - `Radio::set_frequency(hz)` / `Radio::get_frequency()`: zmiana częstotliwości
   z lambdy. Przestrojenie wykonuje wątek odbiornika, więc nie ma równoległego
   dostępu do SPI.

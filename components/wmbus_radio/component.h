@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 
 #include "freertos/FreeRTOS.h"
@@ -26,9 +27,17 @@ public:
 
   void add_frame_handler(std::function<void(Frame *)> &&callback);
 
+  // Request a frequency change (safe to call from lambdas). The radio is
+  // retuned by the receiver task, so SPI access is never concurrent.
+  void set_frequency(uint32_t hz);
+  uint32_t get_frequency();
+
 protected:
   static void wakeup_receiver_task_from_isr(TaskHandle_t *arg);
   static void receiver_task(Radio *arg);
+  bool apply_pending_frequency_();
+
+  std::atomic<uint32_t> pending_frequency_{0};
 
   RadioTransceiver *radio{nullptr};
   TaskHandle_t receiver_task_handle_{nullptr};
